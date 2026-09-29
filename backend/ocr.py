@@ -15,7 +15,7 @@ def ocr_pdf(pdf_path, progress_callback=None):
     os.makedirs(output_folder, exist_ok=True)
 
     # -----------------------------
-    # Load Surya OCR model
+    # Load Surya OCR model.
     # -----------------------------
 
     if progress_callback:
