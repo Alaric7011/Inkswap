@@ -5,17 +5,21 @@ from surya.recognition import RecognitionPredictor
 import os
 
 
-def ocr_pdf(pdf_path, output_folder="pdf_pages"):
+def ocr_pdf(pdf_path, progress_callback=None):
 
     # -----------------------------
     # Create output folder
     # -----------------------------
 
+    output_folder = "pdf_pages"
     os.makedirs(output_folder, exist_ok=True)
 
     # -----------------------------
     # Load Surya OCR model
     # -----------------------------
+
+    if progress_callback:
+        progress_callback("Loading Surya OCR model...")
 
     manager = SuryaInferenceManager()
     recognizer = RecognitionPredictor(manager)
@@ -26,6 +30,13 @@ def ocr_pdf(pdf_path, output_folder="pdf_pages"):
 
     doc = fitz.open(pdf_path)
 
+    total_pages = len(doc)
+
+    if progress_callback:
+        progress_callback(
+            f"PDF loaded — {total_pages} page(s) found."
+        )
+
     complete_text = ""
 
     # -----------------------------
@@ -33,6 +44,11 @@ def ocr_pdf(pdf_path, output_folder="pdf_pages"):
     # -----------------------------
 
     for i, page in enumerate(doc):
+
+        if progress_callback:
+            progress_callback(
+                f"Running Surya OCR — Page {i + 1}/{total_pages}"
+            )
 
         # Convert PDF page to image
         pix = page.get_pixmap(dpi=300)
@@ -80,6 +96,14 @@ def ocr_pdf(pdf_path, output_folder="pdf_pages"):
 
         complete_text += page_text
 
+        if progress_callback:
+            progress_callback(
+                f"Page {i + 1}/{total_pages} OCR completed."
+            )
+
     doc.close()
+
+    if progress_callback:
+        progress_callback("All pages OCR completed.")
 
     return complete_text

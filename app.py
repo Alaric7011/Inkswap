@@ -1,16 +1,90 @@
 import streamlit as st
 import tempfile
 import os
+import re
 
 from backend.ocr import ocr_pdf
 from backend.grader import grade_student
 
 
 st.set_page_config(
-    page_title="AI Answer Sheet Evaluator",
+    page_title="InkSwap",
     page_icon="📝",
     layout="wide"
 )
+
+
+# -----------------------------
+# Marks validation helpers
+# -----------------------------
+
+TOTAL_QUESTIONS = 35
+MCQ_COUNT = 20
+
+
+def max_marks_for(question_number):
+    # Q1-20 are MCQs (1 mark), Q21-35 are short answers (3 marks)
+    return 1 if question_number <= MCQ_COUNT else 3
+
+
+MARKS_LINE = re.compile(
+    r"^(?:Q|Question)?\s*(\d+)\s*[,:\t]\s*(\d+(?:\.\d+)?|\.\d+)"
+    r"\s*(?:/\s*\d+(?:\.\d+)?)?$",
+    re.IGNORECASE
+)
+
+
+def parse_marks_csv(marks_csv):
+    """
+    Parse the LLM output safely.
+    Returns (marks, issues):
+      marks  -> {question_number (int): marks (float)} for valid rows only
+      issues -> list of human-readable problems found
+    """
+
+    marks = {}
+    issues = []
+
+    for raw_line in marks_csv.splitlines():
+
+        line = raw_line.replace('"', "").strip()
+
+        # Skip blanks, code fences and the header row
+        if not line or line.startswith("```"):
+            continue
+
+        if line.lower().startswith("question_number"):
+            continue
+
+        match = MARKS_LINE.match(line)
+
+        if not match:
+            issues.append(f"Ignored unreadable line: '{raw_line.strip()}'")
+            continue
+
+        question_number = int(match.group(1))
+        value = float(match.group(2))
+
+        if not 1 <= question_number <= TOTAL_QUESTIONS:
+            issues.append(f"Ignored unknown question number: {question_number}")
+            continue
+
+        if question_number in marks:
+            issues.append(f"Q{question_number} appeared more than once; kept the first value")
+            continue
+
+        maximum = max_marks_for(question_number)
+
+        if value > maximum:
+            issues.append(
+                f"Q{question_number}: model gave {value:g}, "
+                f"capped to the maximum of {maximum}"
+            )
+            value = maximum
+
+        marks[question_number] = value
+
+    return marks, issues
 
 
 # -----------------------------
@@ -26,12 +100,14 @@ if "exam_name" not in st.session_state:
 if "answer_key" not in st.session_state:
     st.session_state.answer_key = None
 
+if "student_results" not in st.session_state:
+    st.session_state.student_results = []
 
 # -----------------------------
 # Header
 # -----------------------------
 
-st.title("📝 AI Answer Sheet Evaluator")
+st.title("InkSwap - AI Answer Sheet Evaluator")
 st.write("Automatically evaluate handwritten answer sheets using OCR and AI.")
 
 st.divider()
@@ -110,6 +186,10 @@ else:
 
         else:
 
+            # Initialise paths so the finally block is always safe
+            pdf_path = None
+            answer_key_path = None
+
             with st.spinner("Processing answer sheet..."):
 
                 # -----------------------------
@@ -130,11 +210,25 @@ else:
                     # OCR
                     # -----------------------------
 
+                    # -----------------------------
+                    # OCR Progress Display
+                    # -----------------------------
+
                     st.write("🔍 Running handwriting OCR...")
 
-                    ocr_text = ocr_pdf(pdf_path)
+                    progress_box = st.empty()
 
-                    st.success("OCR completed.")
+
+                    def show_ocr_progress(message):
+                        progress_box.info(f"🔄 {message}")
+
+
+                    ocr_text = ocr_pdf(
+                        pdf_path,
+                        progress_callback=show_ocr_progress
+                    )
+
+                    progress_box.success("✅ OCR completed.")
 
                     # -----------------------------
                     # Save answer key temporarily
@@ -162,7 +256,83 @@ else:
                         answer_key_path,
                         ocr_text
                     )
+                    # -----------------------------
+                    # Store Student Result
+                    # -----------------------------
 
+                    parsed_marks, issues = parse_marks_csv(marks_csv)
+
+                    # Retry once if the model skipped any questions
+                    missing = [
+                        q for q in range(1, TOTAL_QUESTIONS + 1)
+                        if q not in parsed_marks
+                    ]
+
+                    if missing:
+
+                        st.write("⚠️ Some questions were missing. Retrying once...")
+
+                        retry_csv = grade_student(
+                            answer_key_path,
+                            ocr_text
+                        )
+
+                        retry_marks, retry_issues = parse_marks_csv(retry_csv)
+
+                        for q in missing:
+                            if q in retry_marks:
+                                parsed_marks[q] = retry_marks[q]
+
+                        issues.extend(retry_issues)
+
+                    # Anything still missing is set to 0 and flagged
+                    still_missing = [
+                        q for q in range(1, TOTAL_QUESTIONS + 1)
+                        if q not in parsed_marks
+                    ]
+
+                    for q in still_missing:
+                        parsed_marks[q] = 0.0
+
+                    if still_missing:
+                        issues.append(
+                            "No marks returned for: "
+                            + ", ".join(f"Q{q}" for q in still_missing)
+                            + " (set to 0, please review manually)"
+                        )
+
+                    # Always exactly Q1..Q35, in order
+                    student_marks = {
+                        f"Q{q}": parsed_marks[q]
+                        for q in range(1, TOTAL_QUESTIONS + 1)
+                    }
+
+                    # Validated CSV text for display
+                    marks_csv = "Question_Number,Marks\n" + "\n".join(
+                        f"{q},{parsed_marks[q]:g}"
+                        for q in range(1, TOTAL_QUESTIONS + 1)
+                    )
+
+
+                    # Calculate total
+                    total_marks = sum(student_marks.values())
+
+                    # Maximum marks
+                    maximum_marks = 20 + (15 * 3)
+
+                    percentage = (total_marks / maximum_marks) * 100
+
+
+                    # Add student information
+                    student_result = {
+                        "Student_Name": student_name,
+                        "Roll_Number": roll_number,
+                        **student_marks,
+                        "Total_Marks": total_marks,
+                        "Percentage": round(percentage, 2)
+                    }
+
+                    st.session_state.student_results.append(student_result)
                     st.success("Evaluation completed!")
 
                     # -----------------------------
@@ -176,10 +346,90 @@ else:
                         language="text"
                     )
 
+                    if issues:
+                        st.warning(
+                            "Some problems were found in the AI output:\n\n"
+                            + "\n".join(f"- {i}" for i in issues)
+                        )
+
+                except Exception as e:
+
+                    st.error(f"Evaluation failed: {e}")
+
                 finally:
 
-                    if os.path.exists(pdf_path):
+                    if pdf_path and os.path.exists(pdf_path):
                         os.remove(pdf_path)
 
-                    if os.path.exists(answer_key_path):
+                    if answer_key_path and os.path.exists(answer_key_path):
                         os.remove(answer_key_path)
+
+# -----------------------------
+# Evaluated Students
+# -----------------------------
+
+if st.session_state.student_results:
+
+    st.divider()
+
+    st.subheader("👨‍🎓 Evaluated Students")
+
+    # Create simple display table
+    student_display = []
+
+    for student in st.session_state.student_results:
+        student_display.append({
+            "Student Name": student["Student_Name"],
+            "Roll Number": student["Roll_Number"],
+            "Total Marks": f"{student['Total_Marks']:.0f} / 65",
+            "Percentage": f"{student['Percentage']:.2f}%"
+        })
+
+    st.dataframe(
+        student_display,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    # -----------------------------
+    # Generate CSV
+    # -----------------------------
+
+    import pandas as pd
+
+    results_df = pd.DataFrame(
+        st.session_state.student_results
+    )
+
+    # Make question columns appear in order
+    question_columns = [
+        f"Q{i}"
+        for i in range(1, 36)
+    ]
+
+    final_columns = [
+        "Student_Name",
+        "Roll_Number",
+        *question_columns,
+        "Total_Marks",
+        "Percentage"
+    ]
+
+    # Make sure missing question columns exist
+    for column in question_columns:
+        if column not in results_df.columns:
+            results_df[column] = 0
+
+    results_df = results_df[final_columns]
+
+    # Generate CSV
+    csv_data = results_df.to_csv(
+        index=False
+    )
+
+    st.download_button(
+        label="📥 Generate Results CSV",
+        data=csv_data,
+        file_name=f"{st.session_state.exam_name}_results.csv",
+        mime="text/csv"
+    )

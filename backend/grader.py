@@ -136,7 +136,7 @@ Rules:
 
     response = client.chat.completions.create(
         model="qwen/qwen3.8-27b",
-        temperature=1,
+        temperature=0,
         reasoning_effort="none",
         max_tokens=1000,
         messages=[
