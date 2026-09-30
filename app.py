@@ -2,16 +2,73 @@ import streamlit as st
 import tempfile
 import os
 import re
+import json
 
 from backend.ocr import ocr_pdf
 from backend.grader import grade_student
 
 
 st.set_page_config(
-    page_title="InkSwap",
+    page_title="AI Answer Sheet Evaluator",
     page_icon="📝",
     layout="wide"
 )
+
+
+# -----------------------------
+# Check API key
+# -----------------------------
+
+if not os.environ.get("GROQ_API_KEY"):
+    st.error(
+        "🔑 GROQ_API_KEY is not set. Set it as an environment variable "
+        "and restart the app."
+    )
+    st.stop()
+
+
+# -----------------------------
+# Saving results to disk
+# -----------------------------
+
+RESULTS_DIR = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)),
+    "results"
+)
+
+
+def results_file_path(exam_name):
+    safe_name = re.sub(r"[^\w\-]+", "_", exam_name).strip("_") or "exam"
+    return os.path.join(RESULTS_DIR, f"{safe_name}.json")
+
+
+def load_results(exam_name):
+    path = results_file_path(exam_name)
+
+    if not os.path.exists(path):
+        return []
+
+    try:
+        with open(path, "r", encoding="utf-8") as file:
+            data = json.load(file)
+
+        return data if isinstance(data, list) else []
+
+    except (OSError, ValueError):
+        return []
+
+
+def save_results(exam_name, results):
+    os.makedirs(RESULTS_DIR, exist_ok=True)
+
+    path = results_file_path(exam_name)
+    temp_path = path + ".tmp"
+
+    # Write to a temp file first so a crash can't corrupt the saved results
+    with open(temp_path, "w", encoding="utf-8") as file:
+        json.dump(results, file, indent=2)
+
+    os.replace(temp_path, path)
 
 
 # -----------------------------
@@ -103,11 +160,14 @@ if "answer_key" not in st.session_state:
 if "student_results" not in st.session_state:
     st.session_state.student_results = []
 
+if "resumed_count" not in st.session_state:
+    st.session_state.resumed_count = 0
+
 # -----------------------------
 # Header
 # -----------------------------
 
-st.title("InkSwap - AI Answer Sheet Evaluator")
+st.title("📝 AI Answer Sheet Evaluator")
 st.write("Automatically evaluate handwritten answer sheets using OCR and AI.")
 
 st.divider()
@@ -141,6 +201,12 @@ if not st.session_state.evaluation_created:
             st.session_state.exam_name = exam_name
             st.session_state.answer_key = answer_key
 
+            # Bring back students already evaluated for this exam
+            st.session_state.student_results = load_results(exam_name)
+            st.session_state.resumed_count = len(
+                st.session_state.student_results
+            )
+
             st.rerun()
 
 
@@ -153,6 +219,12 @@ else:
     st.header(f"📚 {st.session_state.exam_name}")
 
     st.success("Evaluation created successfully!")
+
+    if st.session_state.resumed_count:
+        st.info(
+            f"Loaded {st.session_state.resumed_count} previously "
+            f"evaluated student(s) for this exam."
+        )
 
     st.write(
         f"Answer Key: **{st.session_state.answer_key.name}**"
@@ -333,6 +405,16 @@ else:
                     }
 
                     st.session_state.student_results.append(student_result)
+
+                    try:
+                        save_results(
+                            st.session_state.exam_name,
+                            st.session_state.student_results
+                        )
+                    except OSError as save_error:
+                        st.warning(
+                            f"Could not save results to disk: {save_error}"
+                        )
                     st.success("Evaluation completed!")
 
                     # -----------------------------
@@ -385,11 +467,19 @@ if st.session_state.student_results:
             "Percentage": f"{student['Percentage']:.2f}%"
         })
 
-    st.dataframe(
-        student_display,
-        use_container_width=True,
-        hide_index=True
-    )
+    try:
+        st.dataframe(
+            student_display,
+            width="stretch",
+            hide_index=True
+        )
+    except Exception:
+        # Older Streamlit versions don't support width="stretch"
+        st.dataframe(
+            student_display,
+            use_container_width=True,
+            hide_index=True
+        )
 
     # -----------------------------
     # Generate CSV

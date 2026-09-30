@@ -1,0 +1,6 @@
+streamlit>=1.50
+pandas>=2.0
+pymupdf>=1.24
+Pillow>=10.0
+surya-ocr>=0.22
+groq>=0.30
