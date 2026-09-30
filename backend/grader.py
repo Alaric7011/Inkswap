@@ -1,9 +1,254 @@
 import csv
 import html
-import re
+import io
 import os
+import re
+
 from groq import Groq
 
+
+# -----------------------------
+# Marks scheme (single source of truth)
+# -----------------------------
+# Marks per question are decided ONLY by the "Type" column of the answer key.
+# To change the scheme (e.g. short answers become 3 marks), edit it here.
+
+MARKS_BY_TYPE = {
+    "mcq": 1,
+    "short_answer": 2,
+}
+
+TYPE_LABELS = {
+    "mcq": "MCQ",
+    "short_answer": "Short answer",
+}
+
+REQUIRED_COLUMNS = ["Question_Number", "Type", "Correct_Answer"]
+
+
+class AnswerKeyError(ValueError):
+    """Raised when the answer key CSV is invalid. Message is user-readable."""
+
+
+def normalize_type(raw_type):
+    # "MCQ", "mcq", "Short_Answer", "short answer", "Short-Answer" all work
+    return re.sub(r"[\s\-]+", "_", (raw_type or "").strip()).lower()
+
+
+def parse_answer_key(raw_bytes):
+    """
+    Parse and validate the answer key CSV.
+
+    Returns a list of dicts sorted by question number:
+        {"number": int, "type": "mcq" | "short_answer",
+         "answer": str, "max_marks": int}
+
+    Raises AnswerKeyError with a readable message if anything is wrong.
+    """
+
+    try:
+        text = raw_bytes.decode("utf-8-sig")  # utf-8-sig strips Excel's BOM
+    except UnicodeDecodeError:
+        raise AnswerKeyError(
+            "The answer key is not valid UTF-8 text. "
+            "Re-save it as 'CSV UTF-8'."
+        )
+
+    reader = csv.DictReader(io.StringIO(text))
+
+    if not reader.fieldnames:
+        raise AnswerKeyError("The answer key CSV is empty.")
+
+    # Tolerate stray spaces in header names
+    reader.fieldnames = [name.strip() for name in reader.fieldnames]
+
+    missing_columns = [
+        column for column in REQUIRED_COLUMNS
+        if column not in reader.fieldnames
+    ]
+
+    if missing_columns:
+        raise AnswerKeyError(
+            "The answer key is missing column(s): "
+            + ", ".join(missing_columns)
+            + ". Expected: "
+            + ", ".join(REQUIRED_COLUMNS)
+            + "."
+        )
+
+    rows = []
+    seen = set()
+
+    for line_number, row in enumerate(reader, start=2):
+
+        values = [(v or "").strip() for v in row.values() if v is not None]
+
+        # Skip completely blank lines
+        if not any(values):
+            continue
+
+        raw_number = (row.get("Question_Number") or "").strip()
+
+        try:
+            number = int(raw_number)
+        except ValueError:
+            raise AnswerKeyError(
+                f"Line {line_number}: Question_Number '{raw_number}' "
+                f"is not a whole number."
+            )
+
+        if number in seen:
+            raise AnswerKeyError(
+                f"Question {number} appears more than once in the answer key."
+            )
+
+        seen.add(number)
+
+        question_type = normalize_type(row.get("Type"))
+
+        if question_type not in MARKS_BY_TYPE:
+            allowed = ", ".join(TYPE_LABELS.values())
+            raise AnswerKeyError(
+                f"Question {number}: unknown Type "
+                f"'{(row.get('Type') or '').strip()}'. Allowed: {allowed}."
+            )
+
+        answer = (row.get("Correct_Answer") or "").strip()
+
+        if not answer:
+            raise AnswerKeyError(
+                f"Question {number}: Correct_Answer is empty."
+            )
+
+        rows.append({
+            "number": number,
+            "type": question_type,
+            "answer": answer,
+            "max_marks": MARKS_BY_TYPE[question_type],
+        })
+
+    if not rows:
+        raise AnswerKeyError("The answer key has no questions.")
+
+    rows.sort(key=lambda r: r["number"])
+
+    expected = list(range(1, len(rows) + 1))
+    actual = [r["number"] for r in rows]
+
+    if actual != expected:
+        missing = sorted(set(expected) - set(actual))
+        raise AnswerKeyError(
+            "Question numbers must run 1 to "
+            f"{len(rows)} with no gaps. "
+            + (f"Missing: {missing}." if missing else
+               f"Found numbers up to {max(actual)}.")
+        )
+
+    return rows
+
+
+def total_marks(answer_key):
+    return sum(row["max_marks"] for row in answer_key)
+
+
+def describe_key(answer_key):
+    """Short human summary, e.g. '35 questions, 50 marks (20 MCQ x 1, 15 Short answer x 2)'."""
+
+    parts = []
+
+    for question_type, marks in MARKS_BY_TYPE.items():
+        count = sum(1 for r in answer_key if r["type"] == question_type)
+        if count:
+            parts.append(f"{count} {TYPE_LABELS[question_type]} × {marks}")
+
+    return (
+        f"{len(answer_key)} questions, {total_marks(answer_key):g} marks "
+        f"({', '.join(parts)})"
+    )
+
+
+# -----------------------------
+# Parsing the LLM's marks CSV
+# -----------------------------
+
+MARKS_LINE = re.compile(
+    r"^(?:Q|Question)?\s*(\d+)\s*[,:\t]\s*(\d+(?:\.\d+)?|\.\d+)"
+    r"\s*(?:/\s*\d+(?:\.\d+)?)?$",
+    re.IGNORECASE
+)
+
+
+def parse_marks_csv(marks_csv, answer_key):
+    """
+    Parse the LLM output safely against the answer key.
+    Returns (marks, issues):
+      marks  -> {question_number (int): marks (int)} for valid rows only
+      issues -> list of human-readable problems found
+    Marks are whole numbers only, capped at each question's maximum.
+    """
+
+    max_by_question = {r["number"]: r["max_marks"] for r in answer_key}
+
+    marks = {}
+    issues = []
+
+    for raw_line in marks_csv.splitlines():
+
+        line = raw_line.replace('"', "").strip()
+
+        # Skip blanks, code fences and the header row
+        if not line or line.startswith("```"):
+            continue
+
+        if line.lower().startswith("question_number"):
+            continue
+
+        match = MARKS_LINE.match(line)
+
+        if not match:
+            issues.append(f"Ignored unreadable line: '{raw_line.strip()}'")
+            continue
+
+        question_number = int(match.group(1))
+        value = float(match.group(2))
+
+        if question_number not in max_by_question:
+            issues.append(f"Ignored unknown question number: {question_number}")
+            continue
+
+        if question_number in marks:
+            issues.append(
+                f"Q{question_number} appeared more than once; "
+                f"kept the first value"
+            )
+            continue
+
+        maximum = max_by_question[question_number]
+
+        # Whole marks only (0 / 1 / 2 ...): round anything else
+        if value != int(value):
+            rounded = int(value + 0.5)
+            issues.append(
+                f"Q{question_number}: model gave {value:g}, "
+                f"rounded to {rounded} (whole marks only)"
+            )
+            value = rounded
+
+        if value > maximum:
+            issues.append(
+                f"Q{question_number}: model gave {value:g}, "
+                f"capped to the maximum of {maximum}"
+            )
+            value = maximum
+
+        marks[question_number] = int(value)
+
+    return marks, issues
+
+
+# -----------------------------
+# Groq client
+# -----------------------------
 
 _client = None
 
@@ -70,23 +315,30 @@ def clean_ocr_text(text):
     return text.strip()
 
 
-def grade_student(answer_key_path, ocr_text):
+def grade_student(answer_key, ocr_text):
+    """
+    answer_key: list of dicts from parse_answer_key()
+    ocr_text:   raw OCR text for one student
+    Returns the model's raw CSV text (validate it with parse_marks_csv).
+    """
 
     # -----------------------------
-    # Read answer key
+    # Answer key text (marks come from the key, not hard-coded ranges)
     # -----------------------------
-
-    with open(answer_key_path, "r", encoding="utf-8") as file:
-        answer_key = list(csv.DictReader(file))
 
     answer_key_text = ""
 
     for row in answer_key:
+        marks = row["max_marks"]
         answer_key_text += (
-            f"Question {row['Question_Number']} "
-            f"({row['Type']}): "
-            f"{row['Correct_Answer']}\n"
+            f"Question {row['number']} "
+            f"({TYPE_LABELS[row['type']]}, "
+            f"{marks} mark{'s' if marks != 1 else ''}): "
+            f"{row['answer']}\n"
         )
+
+    question_count = len(answer_key)
+    paper_summary = describe_key(answer_key)
 
     # -----------------------------
     # Clean OCR HTML into plain text
@@ -122,6 +374,14 @@ Your job is to understand the student's answers based on their MEANING.
 DO NOT rely on exact word-to-word matching.
 
 ========================
+PAPER STRUCTURE
+========================
+
+{paper_summary}
+
+Each question's type and maximum marks are given in the answer key below.
+
+========================
 PROFESSOR ANSWER KEY
 ========================
 
@@ -147,16 +407,12 @@ by the grading instructions below.
 GRADING INSTRUCTIONS
 ========================
 
-Questions 1-20 are MCQs.
-
-For MCQs:
+For MCQ questions:
 - Compare the student's selected option with the correct option.
 - Correct answer = full marks.
-- Incorrect answer = 0 marks.
+- Incorrect, missing, or unclear answer = 0 marks.
 
-Questions 21-35 are short-answer questions.
-
-For short answers:
+For Short answer questions:
 - Compare the student's answer with the professor's answer conceptually.
 - Do NOT require the same wording.
 - Ignore grammar and spelling mistakes when the intended meaning is clear.
@@ -167,14 +423,13 @@ For short answers:
 - Do not penalize a student simply because they explain the concept differently from the professor.
 - Do not invent information that the student did not write.
 
+Marks are WHOLE NUMBERS only (no halves). Never give more than the
+maximum marks shown for that question in the answer key.
+
 First identify which text belongs to each question.
 The questions may appear out of order in the OCR text.
 
-Then grade every question from 1 to 35.
-
-Assume:
-- Questions 1-20 = 1 mark each.
-- Questions 21-35 = 3 marks each.
+Then grade every question from 1 to {question_count}.
 
 ========================
 OUTPUT FORMAT
@@ -190,13 +445,12 @@ The CSV must have exactly these columns:
 
 Question_Number,Marks
 
-Return exactly one row for every question from 1 to 35.
+Return exactly one row for every question from 1 to {question_count}.
 
 Rules:
-- Questions 1-20: Marks must be either 0 or 1.
-- Questions 21-35: Marks must be between 0 and 3.
+- Marks must be a whole number from 0 up to that question's maximum marks.
 - Use numeric values only for Marks.
-- Do not write "1/1", "3/3", etc.
+- Do not write "1/1", "2/2", etc.
 - Do not omit questions.
 - Keep questions in numerical order.
 """
@@ -209,7 +463,7 @@ Rules:
         model="qwen/qwen3.8-27b",
         temperature=0,
         reasoning_effort="none",
-        max_tokens=1000,
+        max_tokens=max(1000, 12 * question_count + 200),
         messages=[
             {
                 "role": "user",

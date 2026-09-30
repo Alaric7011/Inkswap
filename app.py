@@ -1,11 +1,17 @@
 import streamlit as st
-import tempfile
 import os
 import re
 import json
 
-from backend.ocr import ocr_pdf
-from backend.grader import grade_student
+import pandas as pd
+
+from backend.pipeline import evaluate_one_student, parse_filename
+from backend.grader import (
+    parse_answer_key,
+    total_marks,
+    describe_key,
+    AnswerKeyError,
+)
 
 
 st.set_page_config(
@@ -71,77 +77,66 @@ def save_results(exam_name, results):
     os.replace(temp_path, path)
 
 
-# -----------------------------
-# Marks validation helpers
-# -----------------------------
-
-TOTAL_QUESTIONS = 35
-MCQ_COUNT = 20
-
-
-def max_marks_for(question_number):
-    # Q1-20 are MCQs (1 mark), Q21-35 are short answers (3 marks)
-    return 1 if question_number <= MCQ_COUNT else 3
-
-
-MARKS_LINE = re.compile(
-    r"^(?:Q|Question)?\s*(\d+)\s*[,:\t]\s*(\d+(?:\.\d+)?|\.\d+)"
-    r"\s*(?:/\s*\d+(?:\.\d+)?)?$",
-    re.IGNORECASE
-)
-
-
-def parse_marks_csv(marks_csv):
+def split_compatible_results(saved_rows, answer_key):
     """
-    Parse the LLM output safely.
-    Returns (marks, issues):
-      marks  -> {question_number (int): marks (float)} for valid rows only
-      issues -> list of human-readable problems found
+    Keep only saved rows scored on the SAME scale as the current answer key
+    (same Max_Marks and same question columns). Older rows, e.g. from the
+    previous 65-mark scheme, are returned separately so they are never
+    silently mixed into a class CSV.
     """
 
-    marks = {}
-    issues = []
+    maximum = total_marks(answer_key)
+    question_columns = [f"Q{r['number']}" for r in answer_key]
 
-    for raw_line in marks_csv.splitlines():
+    compatible = []
+    incompatible = []
 
-        line = raw_line.replace('"', "").strip()
+    for row in saved_rows:
+        if (
+            isinstance(row, dict)
+            and row.get("Max_Marks") == maximum
+            and all(column in row for column in question_columns)
+        ):
+            compatible.append(row)
+        else:
+            incompatible.append(row)
 
-        # Skip blanks, code fences and the header row
-        if not line or line.startswith("```"):
-            continue
+    return compatible, incompatible
 
-        if line.lower().startswith("question_number"):
-            continue
 
-        match = MARKS_LINE.match(line)
+def normalize_roll(value):
+    return str(value or "").strip().casefold()
 
-        if not match:
-            issues.append(f"Ignored unreadable line: '{raw_line.strip()}'")
-            continue
 
-        question_number = int(match.group(1))
-        value = float(match.group(2))
+def clean_cell(value):
+    # Editor cells can come back as None / NaN when cleared
+    if value is None or (isinstance(value, float) and pd.isna(value)):
+        return ""
+    return str(value).strip()
 
-        if not 1 <= question_number <= TOTAL_QUESTIONS:
-            issues.append(f"Ignored unknown question number: {question_number}")
-            continue
 
-        if question_number in marks:
-            issues.append(f"Q{question_number} appeared more than once; kept the first value")
-            continue
+def upsert_result(results, new_row):
+    """Replace the row with the same roll number, or append a new one."""
 
-        maximum = max_marks_for(question_number)
+    key = normalize_roll(new_row["Roll_Number"])
 
-        if value > maximum:
-            issues.append(
-                f"Q{question_number}: model gave {value:g}, "
-                f"capped to the maximum of {maximum}"
-            )
-            value = maximum
+    for index, row in enumerate(results):
+        if normalize_roll(row.get("Roll_Number")) == key:
+            results[index] = new_row
+            return
 
-        marks[question_number] = value
+    results.append(new_row)
 
-    return marks, issues
+
+def show_table(container, data, editable=False, **kwargs):
+    """Full-width table that works on old and new Streamlit versions."""
+
+    function = container.data_editor if editable else container.dataframe
+
+    try:
+        return function(data, width="stretch", hide_index=True, **kwargs)
+    except TypeError:
+        return function(data, use_container_width=True, hide_index=True, **kwargs)
 
 
 # -----------------------------
@@ -154,7 +149,11 @@ if "evaluation_created" not in st.session_state:
 if "exam_name" not in st.session_state:
     st.session_state.exam_name = ""
 
+if "answer_key_name" not in st.session_state:
+    st.session_state.answer_key_name = ""
+
 if "answer_key" not in st.session_state:
+    # Parsed answer key: list of {number, type, answer, max_marks}
     st.session_state.answer_key = None
 
 if "student_results" not in st.session_state:
@@ -162,6 +161,18 @@ if "student_results" not in st.session_state:
 
 if "resumed_count" not in st.session_state:
     st.session_state.resumed_count = 0
+
+if "ignored_count" not in st.session_state:
+    st.session_state.ignored_count = 0
+
+if "batch_signature" not in st.session_state:
+    st.session_state.batch_signature = None
+
+if "batch_version" not in st.session_state:
+    st.session_state.batch_version = 0
+
+if "batch_df" not in st.session_state:
+    st.session_state.batch_df = None
 
 # -----------------------------
 # Header
@@ -183,9 +194,14 @@ if not st.session_state.evaluation_created:
 
     exam_name = st.text_input("Exam Name")
 
-    answer_key = st.file_uploader(
+    answer_key_file = st.file_uploader(
         "Upload Answer Key",
         type=["csv"]
+    )
+
+    st.caption(
+        "CSV columns: Question_Number, Type (MCQ or Short_Answer), "
+        "Correct_Answer. MCQ = 1 mark, Short_Answer = 2 marks."
     )
 
     if st.button("Create Evaluation", type="primary"):
@@ -193,19 +209,35 @@ if not st.session_state.evaluation_created:
         if not exam_name:
             st.warning("Please enter the exam name.")
 
-        elif answer_key is None:
+        elif answer_key_file is None:
             st.warning("Please upload the answer key.")
 
         else:
+            # Parse and validate the key once, up front
+            try:
+                parsed_key = parse_answer_key(answer_key_file.getvalue())
+
+            except AnswerKeyError as key_error:
+                st.error(f"Answer key problem: {key_error}")
+                st.stop()
+
             st.session_state.evaluation_created = True
             st.session_state.exam_name = exam_name
-            st.session_state.answer_key = answer_key
+            st.session_state.answer_key_name = answer_key_file.name
+            st.session_state.answer_key = parsed_key
 
-            # Bring back students already evaluated for this exam
-            st.session_state.student_results = load_results(exam_name)
-            st.session_state.resumed_count = len(
-                st.session_state.student_results
+            # Bring back students already evaluated for this exam,
+            # but only those scored on the same marks scale
+            saved_rows = load_results(exam_name)
+
+            compatible, incompatible = split_compatible_results(
+                saved_rows,
+                parsed_key
             )
+
+            st.session_state.student_results = compatible
+            st.session_state.resumed_count = len(compatible)
+            st.session_state.ignored_count = len(incompatible)
 
             st.rerun()
 
@@ -215,6 +247,10 @@ if not st.session_state.evaluation_created:
 # -----------------------------
 
 else:
+
+    answer_key = st.session_state.answer_key
+    maximum_marks = total_marks(answer_key)
+    question_numbers = [r["number"] for r in answer_key]
 
     st.header(f"📚 {st.session_state.exam_name}")
 
@@ -226,231 +262,275 @@ else:
             f"evaluated student(s) for this exam."
         )
 
+    if st.session_state.ignored_count:
+        st.warning(
+            f"{st.session_state.ignored_count} saved result(s) for this "
+            f"exam were scored on a different marks scale and were NOT "
+            f"loaded. They will be replaced the next time results are saved."
+        )
+
     st.write(
-        f"Answer Key: **{st.session_state.answer_key.name}**"
+        f"Answer Key: **{st.session_state.answer_key_name}**"
     )
+
+    st.write(f"Paper: **{describe_key(answer_key)}**")
 
     st.divider()
 
     st.header("👨‍🎓 Students")
 
-    st.subheader("Add Student")
+    st.subheader("Upload Answer Sheets")
 
-    student_name = st.text_input("Student Name")
-
-    roll_number = st.text_input("Roll Number")
-
-    answer_sheet = st.file_uploader(
-        "Upload Answer Sheet",
-        type=["pdf"]
+    st.caption(
+        "Upload one or many PDFs. Names and roll numbers are guessed from "
+        "the file names (e.g. 101_Ali_Khan.pdf); fix any of them in the "
+        "table before starting."
     )
 
-    if st.button("Evaluate Student", type="primary"):
+    files = st.file_uploader(
+        "Upload Answer Sheets (PDF)",
+        type=["pdf"],
+        accept_multiple_files=True
+    )
 
-        if not student_name:
-            st.warning("Please enter the student name.")
+    if not files:
+        st.session_state.batch_signature = None
 
-        elif not roll_number:
-            st.warning("Please enter the roll number.")
+    else:
 
-        elif answer_sheet is None:
-            st.warning("Please upload the answer sheet.")
+        # Rebuild the editable table only when the set of files changes,
+        # so the teacher's edits are not wiped on every rerun
+        signature = tuple((f.name, f.size) for f in files)
 
-        else:
+        if st.session_state.batch_signature != signature:
 
-            # Initialise paths so the finally block is always safe
-            pdf_path = None
-            answer_key_path = None
+            rows = []
 
-            with st.spinner("Processing answer sheet..."):
+            for f in files:
+                guessed_name, guessed_roll = parse_filename(f.name)
+                rows.append({
+                    "File": f.name,
+                    "Student_Name": guessed_name,
+                    "Roll_Number": guessed_roll,
+                })
 
-                # -----------------------------
-                # Save uploaded PDF temporarily
-                # -----------------------------
+            st.session_state.batch_df = pd.DataFrame(rows)
+            st.session_state.batch_signature = signature
+            st.session_state.batch_version += 1
 
-                with tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix=".pdf"
-                ) as temp_file:
+        edited_df = show_table(
+            st,
+            st.session_state.batch_df,
+            editable=True,
+            key=f"batch_editor_{st.session_state.batch_version}",
+            disabled=["File"]
+        )
 
-                    temp_file.write(answer_sheet.getbuffer())
-                    pdf_path = temp_file.name
+        reevaluate = st.checkbox(
+            "Re-evaluate students who already have results "
+            "(replaces their old row)",
+            value=False
+        )
 
-                try:
+        st.caption(
+            "Don't click around while a batch is running: any interaction "
+            "restarts the page and stops the batch. Finished students are "
+            "saved after each one, so just press the button again to "
+            "continue; already-evaluated students are skipped."
+        )
 
-                    # -----------------------------
-                    # OCR
-                    # -----------------------------
+        if st.button("Evaluate All", type="primary"):
 
-                    # -----------------------------
-                    # OCR Progress Display
-                    # -----------------------------
+            # -----------------------------
+            # Validate the table before starting
+            # -----------------------------
 
-                    st.write("🔍 Running handwriting OCR...")
+            entries = []
+            problems = []
+            rolls_in_batch = {}
 
-                    progress_box = st.empty()
+            for f, row in zip(files, edited_df.to_dict("records")):
 
+                name = clean_cell(row.get("Student_Name"))
+                roll = clean_cell(row.get("Roll_Number"))
 
-                    def show_ocr_progress(message):
-                        progress_box.info(f"🔄 {message}")
-
-
-                    ocr_text = ocr_pdf(
-                        pdf_path,
-                        progress_callback=show_ocr_progress
+                if not name or not roll:
+                    problems.append(
+                        f"{f.name}: student name and roll number are both required."
                     )
+                    continue
 
-                    progress_box.success("✅ OCR completed.")
+                key = normalize_roll(roll)
 
-                    # -----------------------------
-                    # Save answer key temporarily
-                    # -----------------------------
-
-                    with tempfile.NamedTemporaryFile(
-                        mode="wb",
-                        delete=False,
-                        suffix=".csv"
-                    ) as key_file:
-
-                        key_file.write(
-                            st.session_state.answer_key.getbuffer()
-                        )
-
-                        answer_key_path = key_file.name
-
-                    # -----------------------------
-                    # AI Grading
-                    # -----------------------------
-
-                    st.write("🤖 Evaluating answers with AI...")
-
-                    marks_csv = grade_student(
-                        answer_key_path,
-                        ocr_text
+                if key in rolls_in_batch:
+                    problems.append(
+                        f"Roll number '{roll}' is used by both "
+                        f"{rolls_in_batch[key]} and {f.name}."
                     )
-                    # -----------------------------
-                    # Store Student Result
-                    # -----------------------------
+                    continue
 
-                    parsed_marks, issues = parse_marks_csv(marks_csv)
+                rolls_in_batch[key] = f.name
+                entries.append((f, name, roll))
 
-                    # Retry once if the model skipped any questions
-                    missing = [
-                        q for q in range(1, TOTAL_QUESTIONS + 1)
-                        if q not in parsed_marks
-                    ]
+            if problems:
 
-                    if missing:
+                st.error(
+                    "Fix these before starting:\n\n"
+                    + "\n".join(f"- {p}" for p in problems)
+                )
 
-                        st.write("⚠️ Some questions were missing. Retrying once...")
+            else:
 
-                        retry_csv = grade_student(
-                            answer_key_path,
-                            ocr_text
-                        )
+                existing_rolls = {
+                    normalize_roll(r.get("Roll_Number"))
+                    for r in st.session_state.student_results
+                }
 
-                        retry_marks, retry_issues = parse_marks_csv(retry_csv)
+                total_files = len(entries)
 
-                        for q in missing:
-                            if q in retry_marks:
-                                parsed_marks[q] = retry_marks[q]
-
-                        issues.extend(retry_issues)
-
-                    # Anything still missing is set to 0 and flagged
-                    still_missing = [
-                        q for q in range(1, TOTAL_QUESTIONS + 1)
-                        if q not in parsed_marks
-                    ]
-
-                    for q in still_missing:
-                        parsed_marks[q] = 0.0
-
-                    if still_missing:
-                        issues.append(
-                            "No marks returned for: "
-                            + ", ".join(f"Q{q}" for q in still_missing)
-                            + " (set to 0, please review manually)"
-                        )
-
-                    # Always exactly Q1..Q35, in order
-                    student_marks = {
-                        f"Q{q}": parsed_marks[q]
-                        for q in range(1, TOTAL_QUESTIONS + 1)
+                status_rows = [
+                    {
+                        "File": f.name,
+                        "Student": name,
+                        "Roll": roll,
+                        "Status": "Queued",
+                        "Notes": "",
                     }
+                    for f, name, roll in entries
+                ]
 
-                    # Validated CSV text for display
-                    marks_csv = "Question_Number,Marks\n" + "\n".join(
-                        f"{q},{parsed_marks[q]:g}"
-                        for q in range(1, TOTAL_QUESTIONS + 1)
+                overall_bar = st.progress(0.0, text="Starting batch...")
+                current_line = st.empty()
+                status_box = st.empty()
+
+                show_table(status_box, pd.DataFrame(status_rows))
+
+                counts = {"done": 0, "review": 0, "failed": 0, "skipped": 0}
+
+                for index, (f, name, roll) in enumerate(entries):
+
+                    label = f"{index + 1}/{total_files}: {name} ({roll})"
+
+                    # Resume support: skip students already evaluated
+                    if (
+                        normalize_roll(roll) in existing_rolls
+                        and not reevaluate
+                    ):
+                        status_rows[index]["Status"] = "Skipped"
+                        status_rows[index]["Notes"] = "Already evaluated"
+                        counts["skipped"] += 1
+                        show_table(status_box, pd.DataFrame(status_rows))
+                        overall_bar.progress(
+                            (index + 1) / total_files,
+                            text=f"Finished {index + 1} of {total_files}"
+                        )
+                        continue
+
+                    status_rows[index]["Status"] = "Running"
+                    show_table(status_box, pd.DataFrame(status_rows))
+                    overall_bar.progress(
+                        index / total_files,
+                        text=f"Evaluating {label}"
                     )
 
-
-                    # Calculate total
-                    total_marks = sum(student_marks.values())
-
-                    # Maximum marks
-                    maximum_marks = 20 + (15 * 3)
-
-                    percentage = (total_marks / maximum_marks) * 100
-
-
-                    # Add student information
-                    student_result = {
-                        "Student_Name": student_name,
-                        "Roll_Number": roll_number,
-                        **student_marks,
-                        "Total_Marks": total_marks,
-                        "Percentage": round(percentage, 2)
-                    }
-
-                    st.session_state.student_results.append(student_result)
+                    def show_progress(message, label=label):
+                        current_line.info(f"🔄 {label} — {message}")
 
                     try:
-                        save_results(
-                            st.session_state.exam_name,
-                            st.session_state.student_results
+
+                        outcome = evaluate_one_student(
+                            f.getvalue(),
+                            answer_key,
+                            progress_callback=show_progress
                         )
-                    except OSError as save_error:
-                        st.warning(
-                            f"Could not save results to disk: {save_error}"
+
+                        student_marks = {
+                            f"Q{q}": marks
+                            for q, marks in outcome["marks"].items()
+                        }
+
+                        total = sum(student_marks.values())
+                        issues = outcome["issues"]
+
+                        student_result = {
+                            "Student_Name": name,
+                            "Roll_Number": roll,
+                            **student_marks,
+                            "Total_Marks": total,
+                            "Max_Marks": maximum_marks,
+                            "Percentage": round(
+                                (total / maximum_marks) * 100, 2
+                            ),
+                            "Needs_Review": "Yes" if issues else "",
+                            "Review_Notes": " | ".join(issues),
+                        }
+
+                        upsert_result(
+                            st.session_state.student_results,
+                            student_result
                         )
-                    st.success("Evaluation completed!")
 
-                    # -----------------------------
-                    # Display Result
-                    # -----------------------------
+                        # Save after EVERY student so a crash loses at most one
+                        try:
+                            save_results(
+                                st.session_state.exam_name,
+                                st.session_state.student_results
+                            )
+                        except OSError as save_error:
+                            issues = issues + [
+                                f"Could not save to disk: {save_error}"
+                            ]
 
-                    st.subheader("📊 Result")
+                        if issues:
+                            status_rows[index]["Status"] = "Done — review"
+                            status_rows[index]["Notes"] = issues[0] + (
+                                f" (+{len(issues) - 1} more)"
+                                if len(issues) > 1 else ""
+                            )
+                            counts["review"] += 1
+                        else:
+                            status_rows[index]["Status"] = "Done"
+                            counts["done"] += 1
 
-                    st.code(
-                        marks_csv,
-                        language="text"
+                    except Exception as error:
+
+                        status_rows[index]["Status"] = "Failed"
+                        status_rows[index]["Notes"] = str(error)
+                        counts["failed"] += 1
+
+                    show_table(status_box, pd.DataFrame(status_rows))
+                    overall_bar.progress(
+                        (index + 1) / total_files,
+                        text=f"Finished {index + 1} of {total_files}"
                     )
 
-                    if issues:
-                        st.warning(
-                            "Some problems were found in the AI output:\n\n"
-                            + "\n".join(f"- {i}" for i in issues)
-                        )
+                current_line.empty()
 
-                except Exception as e:
+                summary = (
+                    f"Batch finished: {counts['done']} done, "
+                    f"{counts['review']} need review, "
+                    f"{counts['failed']} failed, "
+                    f"{counts['skipped']} skipped."
+                )
 
-                    st.error(f"Evaluation failed: {e}")
-
-                finally:
-
-                    if pdf_path and os.path.exists(pdf_path):
-                        os.remove(pdf_path)
-
-                    if answer_key_path and os.path.exists(answer_key_path):
-                        os.remove(answer_key_path)
+                if counts["failed"]:
+                    st.warning(
+                        summary + " Press Evaluate All again to retry the "
+                        "failed ones; finished students are skipped."
+                    )
+                elif counts["review"]:
+                    st.warning(summary)
+                else:
+                    st.success(summary)
 
 # -----------------------------
 # Evaluated Students
 # -----------------------------
 
-if st.session_state.student_results:
+if st.session_state.evaluation_created and st.session_state.student_results:
+
+    answer_key = st.session_state.answer_key
+    maximum_marks = total_marks(answer_key)
 
     st.divider()
 
@@ -463,38 +543,39 @@ if st.session_state.student_results:
         student_display.append({
             "Student Name": student["Student_Name"],
             "Roll Number": student["Roll_Number"],
-            "Total Marks": f"{student['Total_Marks']:.0f} / 65",
-            "Percentage": f"{student['Percentage']:.2f}%"
+            "Total Marks": f"{student['Total_Marks']:g} / {maximum_marks:g}",
+            "Percentage": f"{student['Percentage']:.2f}%",
+            "Needs Review": student.get("Needs_Review", "")
         })
 
-    try:
-        st.dataframe(
-            student_display,
-            width="stretch",
-            hide_index=True
-        )
-    except Exception:
-        # Older Streamlit versions don't support width="stretch"
-        st.dataframe(
-            student_display,
-            use_container_width=True,
-            hide_index=True
-        )
+    show_table(st, student_display)
+
+    flagged = [
+        s for s in st.session_state.student_results
+        if s.get("Needs_Review")
+    ]
+
+    if flagged:
+        with st.expander(f"⚠️ Review notes ({len(flagged)} student(s))"):
+            for s in flagged:
+                st.markdown(
+                    f"**{s['Student_Name']} ({s['Roll_Number']})**"
+                )
+                for note in s.get("Review_Notes", "").split(" | "):
+                    st.write(f"- {note}")
 
     # -----------------------------
     # Generate CSV
     # -----------------------------
 
-    import pandas as pd
-
     results_df = pd.DataFrame(
         st.session_state.student_results
     )
 
-    # Make question columns appear in order
+    # Question columns come from the answer key, in order
     question_columns = [
-        f"Q{i}"
-        for i in range(1, 36)
+        f"Q{r['number']}"
+        for r in answer_key
     ]
 
     final_columns = [
@@ -502,15 +583,14 @@ if st.session_state.student_results:
         "Roll_Number",
         *question_columns,
         "Total_Marks",
-        "Percentage"
+        "Max_Marks",
+        "Percentage",
+        "Needs_Review",
+        "Review_Notes"
     ]
 
-    # Make sure missing question columns exist
-    for column in question_columns:
-        if column not in results_df.columns:
-            results_df[column] = 0
-
-    results_df = results_df[final_columns]
+    # Older saved rows may lack the review columns
+    results_df = results_df.reindex(columns=final_columns, fill_value="")
 
     # Generate CSV
     csv_data = results_df.to_csv(
