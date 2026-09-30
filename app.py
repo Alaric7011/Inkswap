@@ -9,7 +9,7 @@ from backend.grader import grade_student
 
 
 st.set_page_config(
-    page_title="AI Answer Sheet Evaluator",
+    page_title="InkSwap",
     page_icon="📝",
     layout="wide"
 )
@@ -167,7 +167,7 @@ if "resumed_count" not in st.session_state:
 # Header
 # -----------------------------
 
-st.title("📝 AI Answer Sheet Evaluator")
+st.title("📝 InkSwap - AI Answer Sheet Evaluator")
 st.write("Automatically evaluate handwritten answer sheets using OCR and AI.")
 
 st.divider()
